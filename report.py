@@ -1,9 +1,3 @@
-#!/usr/bin/env python3
-"""
-BTC Entry Signal Agent — v3 (Money-Making Edition)
-4 signals. 3 verdicts. Zero noise.
-"""
-
 import requests
 import os
 from datetime import datetime, timezone
@@ -17,20 +11,29 @@ def get(url, params=None):
     return r.json()
 
 def crypto():
+    # Current price + 24h change
     d = get("https://api.coingecko.com/api/v3/simple/price",
-            {"ids":"bitcoin,ethereum","vs_currencies":"usd","include_24hr_change":"true"})
+            {"ids":"bitcoin","vs_currencies":"usd","include_24hr_change":"true"})
     return {
         "btc": d["bitcoin"]["usd"],
         "btc_24h": d["bitcoin"]["usd_24h_change"],
     }
 
-def binance():
-    fr = get("https://fapi.binance.com/fapi/v1/premiumIndex?symbol=BTCUSDT")
-    oi = get("https://fapi.binance.com/fapi/v1/openInterest?symbol=BTCUSDT")
-    mp = float(fr["markPrice"])
+def crypto_history():
+    # 30 days of daily prices to calculate "heat" (how extended from lows)
+    d = get("https://api.coingecko.com/api/v3/coins/bitcoin/market_chart",
+            {"vs_currency":"usd","days":"30","interval":"daily"})
+    prices = [p[1] for p in d["prices"]]
+    low_7d = min(prices[-7:])   # 7-day low
+    low_30d = min(prices[-30:]) # 30-day low
+    current = prices[-1]
+    heat_7d = (current / low_7d - 1) * 100   # % above 7-day low
+    heat_30d = (current / low_30d - 1) * 100  # % above 30-day low
     return {
-        "funding": float(fr["lastFundingRate"]),
-        "oi_usd": float(oi["openInterest"]) * mp,
+        "heat_7d": heat_7d,
+        "heat_30d": heat_30d,
+        "low_7d": low_7d,
+        "low_30d": low_30d,
     }
 
 def yahoo(sym):
@@ -39,19 +42,24 @@ def yahoo(sym):
     m = d["chart"]["result"][0]["meta"]
     return float(m.get("regularMarketPrice") or m.get("previousClose") or m["chartPreviousClose"])
 
-def assess(btc, btc_24h, funding, yield_10y, dxy):
+def assess(btc, btc_24h, heat_7d, heat_30d, yield_10y, dxy):
     kings = 0
     ctx = 0
     lines = []
 
-    if funding < 0.005:
-        lines.append("🟢 FUNDING: Safe")
+    # KING 1: Heat score (proxy for funding rate / crowding)
+    # < 5% above 7d low = calm (like funding < 0.005)
+    # 5-15% = warm (like funding 0.005-0.01)
+    # > 15% = danger (like funding > 0.01)
+    if heat_7d < 5:
+        lines.append("🟢 HEAT: Calm — +" + str(round(heat_7d,1)) + "% above 7d low")
         kings += 1
-    elif funding < 0.01:
-        lines.append("🟡 FUNDING: Warm")
+    elif heat_7d < 15:
+        lines.append("🟡 HEAT: Warm — +" + str(round(heat_7d,1)) + "% above 7d low")
     else:
-        lines.append("🔴 FUNDING: Danger — " + str(round(funding,4)))
+        lines.append("🔴 HEAT: Danger — +" + str(round(heat_7d,1)) + "% above 7d low")
 
+    # KING 2: 10Y Yield
     if yield_10y < 3.5:
         lines.append("🟢 10Y YIELD: Falling — " + str(round(yield_10y,2)) + "%")
         kings += 1
@@ -60,6 +68,7 @@ def assess(btc, btc_24h, funding, yield_10y, dxy):
     else:
         lines.append("🔴 10Y YIELD: Restrictive — " + str(round(yield_10y,2)) + "%")
 
+    # CONTEXT 1: DXY
     if dxy < 100:
         lines.append("🟢 DXY: Tailwind — " + str(round(dxy,1)))
         ctx += 1
@@ -68,6 +77,7 @@ def assess(btc, btc_24h, funding, yield_10y, dxy):
     else:
         lines.append("🔴 DXY: Headwind — " + str(round(dxy,1)))
 
+    # CONTEXT 2: BTC 24h momentum
     if btc_24h < 5:
         lines.append("🟢 BTC: Calm — 24h " + str(round(btc_24h,1)) + "%")
         ctx += 1
@@ -76,6 +86,7 @@ def assess(btc, btc_24h, funding, yield_10y, dxy):
     else:
         lines.append("🔴 BTC: Chasing — 24h " + str(round(btc_24h,1)) + "%")
 
+    # VERDICT
     if kings == 2 and ctx >= 1:
         verdict = "DEPLOY"
         action = "Buy $10k BTC now. Set limit at -5% ($" + str(round(btc*0.95)) + ")."
@@ -91,14 +102,13 @@ def assess(btc, btc_24h, funding, yield_10y, dxy):
 
     return lines, verdict, action
 
-def build(btc, funding, oi, yield_10y, dxy, lines, verdict, action):
+def build(btc, heat_7d, heat_30d, yield_10y, dxy, lines, verdict, action):
     now = datetime.now(timezone.utc).strftime("%H:%M UTC %d %b")
     out = [
         "📊 *BTC SIGNAL — " + now + "*",
         "",
         "*BTC*: $" + "{:,.0f}".format(btc),
-        "*Funding*: " + str(round(funding,4)) + (" ⚠️" if funding > 0.02 else ""),
-        "*OI*: $" + "{:.1f}".format(oi/1e9) + "B",
+        "*Heat*: +" + str(round(heat_7d,1)) + "% above 7d low (30d: +" + str(round(heat_30d,1)) + "%)",
         "*10Y*: " + str(round(yield_10y,2)) + "%",
         "*DXY*: " + str(round(dxy,1)),
         "",
@@ -112,7 +122,8 @@ def build(btc, funding, oi, yield_10y, dxy, lines, verdict, action):
     ]
     if verdict == "WAIT" or verdict == "DO NOT THINK ABOUT BTC TODAY":
         out.append("💡 Your $30k stays in Binance. Metals untouched.")
-    return "\n".join(out)
+    return "
+".join(out)
 
 def send(text):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -127,11 +138,11 @@ def send(text):
 
 def main():
     c = crypto()
-    b = binance()
+    h = crypto_history()
     y10 = yahoo("^TNX")
     dxy = yahoo("DX-Y.NYB")
-    lines, verdict, action = assess(c["btc"], c["btc_24h"], b["funding"], y10, dxy)
-    report = build(c["btc"], b["funding"], b["oi_usd"], y10, dxy, lines, verdict, action)
+    lines, verdict, action = assess(c["btc"], c["btc_24h"], h["heat_7d"], h["heat_30d"], y10, dxy)
+    report = build(c["btc"], h["heat_7d"], h["heat_30d"], y10, dxy, lines, verdict, action)
     send(report)
     print(verdict)
 
