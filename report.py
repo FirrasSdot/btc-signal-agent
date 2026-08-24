@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
-BTC Entry Signal Agent -- v4.1 (DXY Fix)
-Uses FRED DTWEXM (Major Currencies) instead of DTWEXBGS.
-Adds sanity check for stale DXY data.
+BTC Entry Signal Agent -- v5 (EUR/USD DXY Proxy + Silver Alert)
+Uses exchangerate-api.com for live EUR/USD (no blocks, no key).
 """
 
 import requests
@@ -42,10 +41,19 @@ def get_fred(series):
     except:
         return None
 
-def assess(btc, btc24h, heat7, heat30, y10, dxy):
+def get_eurusd():
+    """Live EUR/USD from exchangerate-api.com (free, no key, no blocks)"""
+    try:
+        d = get("https://api.exchangerate-api.com/v4/latest/USD")
+        return float(d["rates"]["EUR"])
+    except:
+        return None
+
+def assess(btc, btc24h, heat7, heat30, y10, eurusd, silver):
     kings = 0
     ctx = 0
     lines = []
+    alerts = []
 
     # KING 1: Heat
     if heat7 < 5:
@@ -68,19 +76,20 @@ def assess(btc, btc24h, heat7, heat30, y10, dxy):
     else:
         lines.append("10Y: No FRED key")
 
-    # CONTEXT 1: DXY (with sanity check)
-    if dxy is not None:
-        if dxy > 110:
-            lines.append("DXY: Stale data? -- " + str(round(dxy,1)) + " (check FRED series)")
-        elif dxy < 100:
-            lines.append("DXY: Tailwind -- " + str(round(dxy,1)))
+    # CONTEXT 1: DXY proxy via EUR/USD
+    # EUR/USD > 1.08 = dollar weak (green)
+    # EUR/USD 1.02-1.08 = neutral (yellow)
+    # EUR/USD < 1.02 = dollar strong (red)
+    if eurusd is not None:
+        if eurusd > 1.08:
+            lines.append("DXY: Tailwind (EUR/USD " + str(round(eurusd,4)) + ")")
             ctx += 1
-        elif dxy < 104:
-            lines.append("DXY: Neutral -- " + str(round(dxy,1)))
+        elif eurusd > 1.02:
+            lines.append("DXY: Neutral (EUR/USD " + str(round(eurusd,4)) + ")")
         else:
-            lines.append("DXY: Headwind -- " + str(round(dxy,1)))
+            lines.append("DXY: Headwind (EUR/USD " + str(round(eurusd,4)) + ")")
     else:
-        lines.append("DXY: No FRED key")
+        lines.append("DXY: EUR/USD fetch failed")
 
     # CONTEXT 2: BTC 24h
     if btc24h < 5:
@@ -90,6 +99,13 @@ def assess(btc, btc24h, heat7, heat30, y10, dxy):
         lines.append("BTC: Heating -- 24h " + str(round(btc24h,1)) + "%")
     else:
         lines.append("BTC: Chasing -- 24h " + str(round(btc24h,1)) + "%")
+
+    # SILVER ALERT
+    if silver is not None:
+        if silver >= 70:
+            alerts.append("SILVER BREAKOUT: $" + str(round(silver,2)) + " >= $70! Metals bull broadening.")
+        elif silver >= 65:
+            alerts.append("SILVER WATCH: $" + str(round(silver,2)) + " -- approaching $70 breakout.")
 
     # VERDICT
     if kings == 2 and ctx >= 1:
@@ -105,13 +121,25 @@ def assess(btc, btc24h, heat7, heat30, y10, dxy):
         verdict = "DO NOT THINK ABOUT BTC TODAY"
         action = "Both kings red. Close the app. Go outside."
 
-    return lines, verdict, action
+    return lines, alerts, verdict, action
 
-def build(btc, heat7, heat30, lines, verdict, action):
+def build(btc, heat7, heat30, eurusd, silver, lines, alerts, verdict, action):
     now = datetime.now(timezone.utc).strftime("%H:%M UTC %d %b")
     out = "BTC SIGNAL -- " + now + "\n\n"
     out += "BTC: $" + "{:,.0f}".format(btc) + "\n"
-    out += "Heat: +" + str(round(heat7,1)) + "% above 7d low (30d: +" + str(round(heat30,1)) + "%)\n\n"
+    out += "Heat: +" + str(round(heat7,1)) + "% above 7d low (30d: +" + str(round(heat30,1)) + "%)\n"
+    if eurusd is not None:
+        out += "EUR/USD: " + str(round(eurusd,4)) + " (DXY proxy)\n"
+    if silver is not None:
+        out += "Silver: $" + str(round(silver,2)) + "\n"
+    out += "\n"
+
+    if alerts:
+        out += "ALERTS:\n"
+        for alert in alerts:
+            out += alert + "\n"
+        out += "\n"
+
     out += "Signals:\n"
     for line in lines:
         out += line + "\n"
@@ -133,9 +161,10 @@ def main():
     c = crypto()
     h = crypto_history()
     y10 = get_fred("DGS10")
-    dxy = get_fred("DTWEXM")  # Major currencies index (closer to ICE DXY)
-    lines, verdict, action = assess(c["btc"], c["btc_24h"], h["heat7"], h["heat30"], y10, dxy)
-    report = build(c["btc"], h["heat7"], h["heat30"], lines, verdict, action)
+    eurusd = get_eurusd()
+    silver = get_fred("SLVPRUSD")
+    lines, alerts, verdict, action = assess(c["btc"], c["btc_24h"], h["heat7"], h["heat30"], y10, eurusd, silver)
+    report = build(c["btc"], h["heat7"], h["heat30"], eurusd, silver, lines, alerts, verdict, action)
     send(report)
     print(verdict)
 
