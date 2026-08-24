@@ -1,8 +1,21 @@
+name: BTC Entry Signal Agent
+
+on:
+  schedule:
+    - cron: '0 8 * * *'
+    - cron: '0 12 * * *'
+    - cron: '0 20 * * *'
+  workflow_dispatch:
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
       - run: pip install requests
-      - name: Debug env vars
-        run: |
-          echo "FRED key exists: ${{ secrets.FRED_API_KEY != '' }}"
-          echo "CryptoQuant key exists: ${{ secrets.CRYPTOQUANT_API_KEY != '' }}"
       - run: python report.py
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
