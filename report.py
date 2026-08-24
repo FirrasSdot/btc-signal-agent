@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-BTC Entry Signal Agent -- v5 (EUR/USD DXY Proxy + Silver Alert)
-Uses exchangerate-api.com for live EUR/USD (no blocks, no key).
+BTC Entry Signal Agent -- v6 (Funding Rate is Back)
+King signals: Funding rate (CryptoQuant) + 10Y yield (FRED)
+Context: Heat (CoinGecko), EUR/USD proxy, BTC 24h, Silver alert
 """
 
 import requests
@@ -11,9 +12,10 @@ from datetime import datetime, timezone
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 FRED_API_KEY = os.getenv("FRED_API_KEY")
+CRYPTOQUANT_API_KEY = os.getenv("CRYPTOQUANT_API_KEY")
 
-def get(url, params=None):
-    r = requests.get(url, params=params, timeout=15)
+def get(url, params=None, headers=None):
+    r = requests.get(url, params=params, headers=headers, timeout=15)
     r.raise_for_status()
     return r.json()
 
@@ -31,6 +33,45 @@ def crypto_history():
     cur = prices[-1]
     return {"heat7": (cur/low7-1)*100, "heat30": (cur/low30-1)*100}
 
+def get_funding():
+    """Funding rate from CryptoQuant (free tier: 1000 req/day)"""
+    if not CRYPTOQUANT_API_KEY:
+        return None
+    try:
+        # Try multiple endpoint patterns
+        headers = {"Authorization": "Bearer " + CRYPTOQUANT_API_KEY}
+
+        # Pattern 1: /btc/network-indicator/funding-rates
+        try:
+            d = get("https://api.cryptoquant.com/v1/btc/network-indicator/funding-rates",
+                    {"window":"day","limit":"1"}, headers=headers)
+            if "result" in d and len(d["result"]) > 0:
+                return float(d["result"][0]["funding_rate"])
+        except:
+            pass
+
+        # Pattern 2: /btc/market-indicator/funding-rates
+        try:
+            d = get("https://api.cryptoquant.com/v1/btc/market-indicator/funding-rates",
+                    {"window":"day","limit":"1"}, headers=headers)
+            if "result" in d and len(d["result"]) > 0:
+                return float(d["result"][0]["funding_rate"])
+        except:
+            pass
+
+        # Pattern 3: /btc/exchange/aggregated-funding-rates
+        try:
+            d = get("https://api.cryptoquant.com/v1/btc/exchange/aggregated-funding-rates",
+                    {"window":"day","limit":"1"}, headers=headers)
+            if "result" in d and len(d["result"]) > 0:
+                return float(d["result"][0]["funding_rate"])
+        except:
+            pass
+
+        return None
+    except:
+        return None
+
 def get_fred(series):
     if not FRED_API_KEY:
         return None
@@ -42,27 +83,29 @@ def get_fred(series):
         return None
 
 def get_eurusd():
-    """Live EUR/USD from exchangerate-api.com (free, no key, no blocks)"""
     try:
         d = get("https://api.exchangerate-api.com/v4/latest/USD")
         return float(d["rates"]["EUR"])
     except:
         return None
 
-def assess(btc, btc24h, heat7, heat30, y10, eurusd, silver):
+def assess(btc, btc24h, funding, heat7, y10, eurusd, silver):
     kings = 0
     ctx = 0
     lines = []
     alerts = []
 
-    # KING 1: Heat
-    if heat7 < 5:
-        lines.append("HEAT: Safe -- +" + str(round(heat7,1)) + "% above 7d low")
-        kings += 1
-    elif heat7 < 15:
-        lines.append("HEAT: Warm -- +" + str(round(heat7,1)) + "% above 7d low")
+    # KING 1: Funding rate
+    if funding is not None:
+        if funding < 0.005:
+            lines.append("FUNDING: Safe -- " + str(round(funding,4)))
+            kings += 1
+        elif funding < 0.01:
+            lines.append("FUNDING: Warm -- " + str(round(funding,4)))
+        else:
+            lines.append("FUNDING: Danger -- " + str(round(funding,4)))
     else:
-        lines.append("HEAT: Danger -- +" + str(round(heat7,1)) + "% above 7d low")
+        lines.append("FUNDING: No CryptoQuant key -- add CRYPTOQUANT_API_KEY secret")
 
     # KING 2: 10Y yield
     if y10 is not None:
@@ -76,10 +119,26 @@ def assess(btc, btc24h, heat7, heat30, y10, eurusd, silver):
     else:
         lines.append("10Y: No FRED key")
 
-    # CONTEXT 1: DXY proxy via EUR/USD
-    # EUR/USD > 1.08 = dollar weak (green)
-    # EUR/USD 1.02-1.08 = neutral (yellow)
-    # EUR/USD < 1.02 = dollar strong (red)
+    # CONTEXT 1: Heat (backup when funding unavailable)
+    if funding is None:
+        if heat7 < 5:
+            lines.append("HEAT: Safe -- +" + str(round(heat7,1)) + "% above 7d low")
+            ctx += 1
+        elif heat7 < 15:
+            lines.append("HEAT: Warm -- +" + str(round(heat7,1)) + "% above 7d low")
+        else:
+            lines.append("HEAT: Danger -- +" + str(round(heat7,1)) + "% above 7d low")
+    else:
+        # Show heat as context even when funding is available
+        if heat7 < 5:
+            lines.append("HEAT: Calm -- +" + str(round(heat7,1)) + "%")
+            ctx += 1
+        elif heat7 < 15:
+            lines.append("HEAT: Extended -- +" + str(round(heat7,1)) + "%")
+        else:
+            lines.append("HEAT: Overbought -- +" + str(round(heat7,1)) + "%")
+
+    # CONTEXT 2: DXY proxy via EUR/USD
     if eurusd is not None:
         if eurusd > 1.08:
             lines.append("DXY: Tailwind (EUR/USD " + str(round(eurusd,4)) + ")")
@@ -91,7 +150,7 @@ def assess(btc, btc24h, heat7, heat30, y10, eurusd, silver):
     else:
         lines.append("DXY: EUR/USD fetch failed")
 
-    # CONTEXT 2: BTC 24h
+    # CONTEXT 3: BTC 24h
     if btc24h < 5:
         lines.append("BTC: Calm -- 24h " + str(round(btc24h,1)) + "%")
         ctx += 1
@@ -123,13 +182,15 @@ def assess(btc, btc24h, heat7, heat30, y10, eurusd, silver):
 
     return lines, alerts, verdict, action
 
-def build(btc, heat7, heat30, eurusd, silver, lines, alerts, verdict, action):
+def build(btc, funding, heat7, heat30, eurusd, silver, lines, alerts, verdict, action):
     now = datetime.now(timezone.utc).strftime("%H:%M UTC %d %b")
     out = "BTC SIGNAL -- " + now + "\n\n"
     out += "BTC: $" + "{:,.0f}".format(btc) + "\n"
+    if funding is not None:
+        out += "Funding: " + str(round(funding,4)) + "\n"
     out += "Heat: +" + str(round(heat7,1)) + "% above 7d low (30d: +" + str(round(heat30,1)) + "%)\n"
     if eurusd is not None:
-        out += "EUR/USD: " + str(round(eurusd,4)) + " (DXY proxy)\n"
+        out += "EUR/USD: " + str(round(eurusd,4)) + "\n"
     if silver is not None:
         out += "Silver: $" + str(round(silver,2)) + "\n"
     out += "\n"
@@ -160,11 +221,12 @@ def send(text):
 def main():
     c = crypto()
     h = crypto_history()
+    funding = get_funding()
     y10 = get_fred("DGS10")
     eurusd = get_eurusd()
     silver = get_fred("SLVPRUSD")
-    lines, alerts, verdict, action = assess(c["btc"], c["btc_24h"], h["heat7"], h["heat30"], y10, eurusd, silver)
-    report = build(c["btc"], h["heat7"], h["heat30"], eurusd, silver, lines, alerts, verdict, action)
+    lines, alerts, verdict, action = assess(c["btc"], c["btc_24h"], funding, h["heat7"], y10, eurusd, silver)
+    report = build(c["btc"], funding, h["heat7"], h["heat30"], eurusd, silver, lines, alerts, verdict, action)
     send(report)
     print(verdict)
 
